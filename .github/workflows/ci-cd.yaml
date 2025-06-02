@@ -1,0 +1,125 @@
+name: Demo API CI/CD
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main, develop ]
+  push:
+    branches: [ main ]
+
+env:
+  REGISTRY: justranacr.azurecr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    name: Build API
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write  
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}        
+          username: justranacr
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ github.run_number }}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build & push image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+  deploy:
+    name: Deploy API
+    runs-on: ubuntu-latest
+    needs: build
+    # Deploy on push to main branch OR manual trigger
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    
+    steps:
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Set up Helm
+      uses: azure/setup-helm@v3
+      with:
+        version: '3.12.0'
+
+    - name: Configure kubectl
+      run: |
+        mkdir -p $HOME/.kube
+        echo "${{ secrets.KUBECONFIG }}" > $HOME/.kube/config
+        chmod 600 $HOME/.kube/config
+
+    - name: Verify cluster connection
+      run: |
+        kubectl cluster-info
+        kubectl get nodes
+
+    - name: Checkout Helm chart repository
+      uses: actions/checkout@v4
+      with:
+        repository: gbh-recruitment/ismael-ortiz-montero-ismaelortiz87-2025-5-29-senior-devops-challenge
+        token: ${{ secrets.PAT_TOKEN }}
+        path: helm-repo
+
+    - name: Deploy API with Helm
+      run: |
+        IMAGE_REPO=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        IMAGE_VERSION=${{ github.run_number }}
+        FULL_IMAGE=$IMAGE_REPO:$IMAGE_VERSION
+
+        echo "Deploying WebApp with image: $FULL_IMAGE"
+        echo "Image Repository: $IMAGE_REPO"
+        echo "Image Tag: $IMAGE_VERSION"
+        
+        echo "Deploying API with image: $FULL_IMAGE"
+        
+        # Deploy using Helm
+        helm upgrade --install demo-api ./helm-repo/part_2/helm/generic-web-chart \
+          --namespace gbh \
+          --values ./helm-repo/part_2/helm/generic-web-chart/values-api.yaml \
+          --set fullnameOverride=api \
+          --set image.repository="$IMAGE_REPO" \
+          --set image.tag="$IMAGE_VERSION" \
+          --set image.pullPolicy=Always \
+          --set env.REACT_APP_API_URL="$REACT_APP_API_URL" \
+          --timeout=10m \
+          --wait
